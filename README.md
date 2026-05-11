@@ -66,7 +66,7 @@ cd copyninja-rs
 ```
 
 This will:
-1. **Acquire the binary** — tries to download a prebuilt binary from the latest [GitHub Release](https://github.com/Yogesh190602/Copyninja/releases) matching your architecture (`x86_64` / `aarch64`). Verifies the SHA256 (if published) and that the binary actually runs on your system. Falls back to building from source with `cargo build --release` if any step fails (no release, glibc too old, download failed, unusual architecture). Force source build with `COPYNINJA_BUILD_FROM_SOURCE=1 ./install.sh`.
+1. **Acquire the binary** — tries to download a prebuilt binary from the latest [GitHub Release](https://github.com/Yogesh190602/Copyninjaa/releases) matching your architecture (`x86_64` / `aarch64`). Verifies the SHA256 (if published) and that the binary actually runs on your system. Falls back to building from source with `cargo build --release` if any step fails (no release, glibc too old, download failed, unusual architecture). Force source build with `COPYNINJA_BUILD_FROM_SOURCE=1 ./install.sh`.
 2. Install to `~/.local/bin/copyninja`
 3. Set up the systemd user service
 4. Configure the Super+Shift+V keybinding for your DE

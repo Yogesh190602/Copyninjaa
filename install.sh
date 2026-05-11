@@ -160,7 +160,7 @@ if [[ "$SESSION_TYPE" == "wayland" || "$SESSION_TYPE" == "both" ]] && command -v
 fi
 
 # ── 2. Acquire binary: prefer prebuilt from GitHub, fall back to source ───
-GITHUB_REPO="Yogesh190602/Copyninja"
+GITHUB_REPO="Yogesh190602/Copyninjaa"
 BUILT_BINARY=""
 
 # Map `uname -m` to Rust target triples for release asset naming.

@@ -124,9 +124,21 @@ async fn get_clipboard_bytes(mime: &str) -> Option<Vec<u8>> {
 }
 
 async fn get_clipboard_hash() -> String {
-    // Use text hash for change detection (fastest, works for text changes)
-    get_clipboard_text()
-        .await
-        .map(|t| crate::storage::get_hash(&t))
-        .unwrap_or_default()
+    // Hash TARGETS + preferred payload so image↔image and text↔image
+    // transitions are detected, not just text changes.
+    let targets = list_targets().await.unwrap_or_default();
+    if targets.is_empty() {
+        return String::new();
+    }
+
+    let image_mimes = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"];
+    let payload = if let Some(mime) = image_mimes.iter().find(|m| targets.contains(&m.to_string())) {
+        get_clipboard_bytes(mime).await.unwrap_or_default()
+    } else {
+        get_clipboard_text().await.map(|s| s.into_bytes()).unwrap_or_default()
+    };
+
+    let mut to_hash: Vec<u8> = targets.join(",").into_bytes();
+    to_hash.extend_from_slice(&payload);
+    crate::storage::get_hash_bytes(&to_hash)
 }
