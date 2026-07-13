@@ -9,6 +9,27 @@ warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 step()  { echo -e "${CYAN}[→]${NC} $*"; }
 
+# ── Refuse to run as root ─────────────────────────────────────────────────
+# CopyNinja installs a *user* systemd service and per-user keybindings/config.
+# Running under sudo makes $HOME=/root (binary lands in /root/.local/bin) and
+# `systemctl --user` fails with "$DBUS_SESSION_BUS_ADDRESS not defined" because
+# root has no graphical user session bus. Run as your normal user — the script
+# calls `sudo` itself only for the steps that genuinely need root.
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        error "Don't run this with sudo. Re-run it as your normal user:
+
+    ./install.sh
+
+The script will prompt for sudo only when it needs to (installing packages,
+adding you to the 'input' group)."
+    else
+        error "Don't run this as root. Log in as your normal desktop user and run:
+
+    ./install.sh"
+    fi
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_NAME="copyninja"
 INSTALL_DIR="$HOME/.local/bin"
