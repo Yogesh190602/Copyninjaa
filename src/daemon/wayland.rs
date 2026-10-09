@@ -1,19 +1,21 @@
+use super::{blocking, is_secret, session};
+use crate::content::IMAGE_MIMES;
 use anyhow::{bail, Result};
 use log::{debug, error, info};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
 /// Start monitoring the Wayland clipboard via `wl-paste --watch`.
 /// This function runs indefinitely until the watcher process exits.
 pub async fn start() -> Result<()> {
     info!("Starting Wayland clipboard watcher (wl-paste --watch)");
 
-    let mut child = Command::new("wl-paste")
+    let mut child = session::command("wl-paste")
         .args(["--watch", "echo", ""])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
 
     // Check if the process exits immediately (no Wayland display)
@@ -53,14 +55,18 @@ async fn fetch_and_store() {
         None => return,
     };
 
+    if is_secret(&types) {
+        debug!("Skipping clipboard content marked as a password");
+        return;
+    }
+
     // Prefer images over text (user likely wants to capture the image)
-    let image_mimes = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"];
-    for mime in &image_mimes {
-        if types.contains(&mime.to_string()) {
+    for mime in IMAGE_MIMES {
+        if types.iter().any(|t| t == mime) {
             match fetch_clipboard_bytes(mime).await {
                 Ok(data) if !data.is_empty() => {
                     debug!("Captured image clipboard ({}, {} bytes)", mime, data.len());
-                    crate::storage::process_image(&data, mime);
+                    blocking(move || crate::storage::process_image(&data, mime)).await;
                     return;
                 }
                 _ => continue,
@@ -71,21 +77,35 @@ async fn fetch_and_store() {
     // File-manager image copy: Nautilus/Files puts text/uri-list (a file:// URI)
     // in the clipboard, not image bytes. If the URI points to a local image,
     // read the file and store its bytes as a proper image entry.
-    if types.contains(&"text/uri-list".to_string()) {
+    if types.iter().any(|t| t == "text/uri-list") {
         if let Ok(uri_list) = fetch_clipboard_bytes("text/uri-list").await {
-            if let Some((data, mime)) = crate::daemon::read_image_from_uri_list(&uri_list) {
-                debug!("Captured image from URI list ({}, {} bytes)", mime, data.len());
-                crate::storage::process_image(&data, &mime);
+            let max = crate::storage::global().max_image_bytes;
+            let found = tokio::task::spawn_blocking(move || {
+                super::read_image_from_uri_list(&uri_list, max)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((data, mime)) = found {
+                debug!(
+                    "Captured image from URI list ({}, {} bytes)",
+                    mime,
+                    data.len()
+                );
+                blocking(move || crate::storage::process_image(&data, &mime)).await;
                 return;
             }
         }
     }
 
     // Fall back to text
-    if types.iter().any(|t| t.contains("text/")) || types.contains(&"UTF8_STRING".to_string()) {
+    if types
+        .iter()
+        .any(|t| t.contains("text/") || t == "UTF8_STRING")
+    {
         match fetch_clipboard_text().await {
             Ok(text) if !text.trim().is_empty() => {
-                crate::storage::process_text(&text);
+                blocking(move || crate::storage::process_text(&text)).await;
             }
             _ => {}
         }
@@ -93,7 +113,7 @@ async fn fetch_and_store() {
 }
 
 async fn list_mime_types() -> Option<Vec<String>> {
-    let output = Command::new("wl-paste")
+    let output = session::command("wl-paste")
         .args(["--list-types"])
         .output()
         .await
@@ -112,7 +132,7 @@ async fn list_mime_types() -> Option<Vec<String>> {
 }
 
 async fn fetch_clipboard_text() -> Result<String> {
-    let output = Command::new("wl-paste")
+    let output = session::command("wl-paste")
         .args(["--type", "text/plain", "--no-newline"])
         .output()
         .await?;
@@ -125,13 +145,17 @@ async fn fetch_clipboard_text() -> Result<String> {
 }
 
 async fn fetch_clipboard_bytes(mime: &str) -> Result<Vec<u8>> {
-    let output = Command::new("wl-paste")
+    let output = session::command("wl-paste")
         .args(["--type", mime])
         .output()
         .await?;
 
     if !output.status.success() {
-        bail!("wl-paste --type {} failed with status: {}", mime, output.status);
+        bail!(
+            "wl-paste --type {} failed with status: {}",
+            mime,
+            output.status
+        );
     }
 
     Ok(output.stdout)
