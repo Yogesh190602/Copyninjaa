@@ -87,8 +87,17 @@ remove_wm_keybinding() {
 remove_wm_window_rules() {
     local config_file="$1"
     if [[ -f "$config_file" ]] && grep -qF "$COPYNINJA_RULES_MARKER" "$config_file" 2>/dev/null; then
-        # Remove the marker line and all consecutive non-empty lines after it
-        sed -i "/$COPYNINJA_RULES_MARKER/,/^$/d" "$config_file"
+        # Remove the marker line and only the CopyNinja rule lines right after
+        # it — never user lines that happen to follow without a blank line.
+        # `cat >` keeps symlinked dotfiles intact.
+        local tmp
+        tmp="$(mktemp)"
+        awk -v marker="$COPYNINJA_RULES_MARKER" '
+            index($0, marker)                            { inrules = 1; next }
+            inrules && index($0, "com.copyninja.picker") { next }
+                                                         { inrules = 0; print }
+        ' "$config_file" > "$tmp" && cat "$tmp" > "$config_file"
+        rm -f "$tmp"
         sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$config_file"
         info "Removed window rules from $config_file"
     fi
@@ -136,10 +145,28 @@ fi
 
 rm -f "$HOME/.config/autostart/copyninja-enable.desktop"
 
+# ── 4b. Remove the /dev/uinput udev rule (installed for ydotool auto-paste) ─
+UDEV_RULE="/etc/udev/rules.d/60-copyninja-uinput.rules"
+MODULES_CONF="/etc/modules-load.d/copyninja-uinput.conf"
+if [[ -f "$UDEV_RULE" ]]; then
+    echo ""
+    echo "  CopyNinja installed $UDEV_RULE, which gives your desktop"
+    echo "  session write access to /dev/uinput (used by ydotool for auto-paste)."
+    echo "  Other tools that use ydotool for typing/pasting may rely on it."
+    read -rp "  Remove it? [y/N] " del_udev || del_udev=""
+    if [[ "$del_udev" =~ ^[Yy]$ ]]; then
+        sudo rm -f "$UDEV_RULE" "$MODULES_CONF"
+        sudo udevadm control --reload-rules || true
+        sudo udevadm trigger --name-match=uinput 2>/dev/null || true
+        info "Removed $UDEV_RULE."
+    fi
+fi
+
 # ── 5. Remove clipboard history ───────────────────────────────────────────
 read -rp "  Delete clipboard history and cached images (~/.clipboard_history.json + backups + ~/.local/share/copyninja/images)? [y/N] " del_data
 if [[ "$del_data" =~ ^[Yy]$ ]]; then
-    rm -f "$HOME/.clipboard_history.json" "$HOME"/.clipboard_history.json.bak.*
+    rm -f "$HOME/.clipboard_history.json" "$HOME"/.clipboard_history.json.bak.* \
+          "$HOME"/.clipboard_history.json.tmp* "$HOME/.clipboard_history.lock"
     rm -rf "$HOME/.local/share/copyninja/images"
     info "Removed history file, backups, and cached images."
 fi

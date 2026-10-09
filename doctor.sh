@@ -14,6 +14,23 @@ fail()  { echo -e "  ${RED}[!!]${NC}  $1"; echo -e "        ${YELLOW}fix:${NC} $
 warn()  { echo -e "  ${YELLOW}[??]${NC}  $1"; echo -e "        ${YELLOW}note:${NC} $2"; WARN_COUNT=$((WARN_COUNT + 1)); }
 check() { if eval "$2"; then pass "$1"; else fail "$1" "$3"; fi; }
 
+# Package-manager-specific install hint for a package name.
+PKG_MGR=""
+for pm in pacman apt-get dnf zypper; do
+    if command -v "$pm" &>/dev/null; then PKG_MGR="$pm"; break; fi
+done
+install_hint() {
+    case "$PKG_MGR" in
+        pacman)  echo "sudo pacman -S $1" ;;
+        apt-get) echo "sudo apt-get install $1" ;;
+        dnf)     echo "sudo dnf install $1" ;;
+        zypper)  echo "sudo zypper install $1" ;;
+        *)       echo "install the '$1' package with your package manager" ;;
+    esac
+}
+
+BIN="$HOME/.local/bin/copyninja"
+
 echo ""
 echo -e "${CYAN}=== CopyNinja install health check ===${NC}"
 echo ""
@@ -48,6 +65,17 @@ if [[ "$SESSION" == "wayland" && "$DESKTOP" == *GNOME* ]]; then
     fi
 fi
 
+# The binary logs config problems (bad values, unknown keys) as WARN lines on
+# stderr at startup — even for --version.
+if [ -x "$BIN" ]; then
+    CONFIG_WARNINGS=$(RUST_LOG=warn "$BIN" --version 2>&1 >/dev/null)
+    if [ -n "$CONFIG_WARNINGS" ]; then
+        warn "config has problems" "$(echo "$CONFIG_WARNINGS" | head -3 | tr '\n' ' ')— edit ~/.config/copyninja/config.toml"
+    else
+        pass "config parses cleanly"
+    fi
+fi
+
 if command -v gsettings &>/dev/null && [[ "$DESKTOP" == *GNOME* ]]; then
     # Custom keybindings live under dynamic dconf paths — we have to query each one.
     FOUND_KEYBIND=""
@@ -75,16 +103,16 @@ if [[ "$SESSION" == "wayland" ]]; then
           "systemctl --user is-active ydotool.service >/dev/null" \
           "systemctl --user enable --now ydotool.service"
 
-    if id -nG | tr ' ' '\n' | grep -qx input; then
-        pass "user in 'input' group"
+    if [ -w /dev/uinput ]; then
+        pass "/dev/uinput writable (ydotool can send keystrokes)"
     else
-        fail "user NOT in 'input' group" \
-             "sudo usermod -aG input \$USER  →  then LOGOUT+LOGIN (required)"
+        fail "/dev/uinput NOT writable for $USER" \
+             "re-run ./install.sh (installs a udev rule for /dev/uinput), then log out/in if it still fails"
     fi
 
     check "/dev/uinput exists" \
           "[ -e /dev/uinput ]" \
-          "sudo modprobe uinput && echo uinput | sudo tee /etc/modules-load.d/uinput.conf"
+          "sudo modprobe uinput && echo uinput | sudo tee /etc/modules-load.d/copyninja-uinput.conf"
 else
     echo "  skipped (not on Wayland)"
 fi
@@ -92,21 +120,28 @@ fi
 echo ""
 echo -e "${CYAN}── Required tools ──${NC}"
 
-check "wl-paste (Wayland clipboard)"    "command -v wl-paste &>/dev/null" "sudo pacman -S wl-clipboard"
-check "xclip (X11 clipboard fallback)"  "command -v xclip &>/dev/null"    "sudo pacman -S xclip"
-check "wtype (wlroots Wayland paste)"   "command -v wtype &>/dev/null"    "sudo pacman -S wtype"
-check "xdotool (X11 paste)"             "command -v xdotool &>/dev/null"  "sudo pacman -S xdotool"
-check "ydotool (Wayland paste via uinput)" "command -v ydotool &>/dev/null" "sudo pacman -S ydotool"
+check "wl-paste (Wayland clipboard)"    "command -v wl-paste &>/dev/null" "$(install_hint wl-clipboard)"
+check "xclip (X11 clipboard fallback)"  "command -v xclip &>/dev/null"    "$(install_hint xclip)"
+check "wtype (wlroots Wayland paste)"   "command -v wtype &>/dev/null"    "$(install_hint wtype)"
+check "xdotool (X11 paste)"             "command -v xdotool &>/dev/null"  "$(install_hint xdotool)"
+check "ydotool (Wayland paste via uinput)" "command -v ydotool &>/dev/null" "$(install_hint ydotool)"
 
 echo ""
 echo -e "${CYAN}── Runtime status ──${NC}"
 
-if command -v "$HOME/.local/bin/copyninja" &>/dev/null; then
-    VERSION=$("$HOME/.local/bin/copyninja" --version 2>&1 || echo "FAILED")
+if [ -x "$BIN" ]; then
+    VERSION=$("$BIN" --version 2>/dev/null || echo "FAILED")
     echo "  version: $VERSION"
 fi
 
 if [ -f "$HOME/.clipboard_history.json" ]; then
+    HIST_MODE=$(stat -c %a "$HOME/.clipboard_history.json" 2>/dev/null)
+    if [ "$HIST_MODE" = "600" ]; then
+        pass "history file is private (mode 600)"
+    else
+        warn "history file is readable by other users (mode ${HIST_MODE:-?})" \
+             "the daemon tightens this on its next save; or run: chmod 600 ~/.clipboard_history.json*"
+    fi
     if command -v python3 &>/dev/null; then
         ENTRY_COUNT=$(python3 -c "import json; print(len(json.load(open('$HOME/.clipboard_history.json'))))" 2>/dev/null || echo "?")
         echo "  clipboard entries captured: $ENTRY_COUNT"
@@ -136,7 +171,7 @@ elif [[ $FAIL_COUNT -eq 0 ]]; then
 else
     echo -e "  ${RED}$FAIL_COUNT failure(s), $WARN_COUNT warning(s). Fix the failures above.${NC}"
     echo ""
-    echo "  After fixing group membership or enabling ydotool, you MUST"
-    echo "  log out and back in (or reboot) for the change to apply."
+    echo "  After fixing /dev/uinput access or enabling ydotool, log out"
+    echo "  and back in (or reboot) if the change does not apply right away."
 fi
 echo ""

@@ -33,6 +33,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_NAME="copyninja"
 INSTALL_DIR="$HOME/.local/bin"
+# Version of the source checkout this script belongs to.
+SOURCE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$SCRIPT_DIR/Cargo.toml" 2>/dev/null | head -n1 || true)"
 
 # ── 0. Detect session ─────────────────────────────────────────────────────
 SESSION_TYPE="${XDG_SESSION_TYPE:-unknown}"
@@ -91,39 +93,100 @@ fi
 # Only external tools used at runtime need to be present.
 step "Checking runtime dependencies…"
 
-MISSING=()
-PACKAGES_TO_INSTALL=()
+# Detect the package manager so we can offer to install what's missing.
+PKG_MGR=""
+for pm in pacman apt-get dnf zypper; do
+    if command -v "$pm" &>/dev/null; then
+        PKG_MGR="$pm"
+        break
+    fi
+done
 
-# notify-send (optional, for future use)
-command -v notify-send &>/dev/null || { MISSING+=("notify-send"); PACKAGES_TO_INSTALL+=("libnotify"); }
+# Map a logical dependency name to this distro's package name.
+pkg_name() {
+    case "$PKG_MGR:$1" in
+        pacman:notify-send)          echo "libnotify" ;;
+        apt-get:notify-send)         echo "libnotify-bin" ;;
+        dnf:notify-send)             echo "libnotify" ;;
+        zypper:notify-send)          echo "libnotify-tools" ;;
+        pacman:gtk4|dnf:gtk4)        echo "gtk4" ;;
+        apt-get:gtk4|zypper:gtk4)    echo "libgtk-4-1" ;;
+        *:wl-paste)                  echo "wl-clipboard" ;;
+        *)                           echo "$1" ;;
+    esac
+}
+
+install_packages() {
+    case "$PKG_MGR" in
+        pacman)  sudo pacman -S --needed --noconfirm "$@" ;;
+        apt-get) sudo apt-get update -qq || true
+                 sudo apt-get install -y "$@" ;;
+        dnf)     sudo dnf install -y "$@" ;;
+        zypper)  sudo zypper install -y "$@" ;;
+        *)       return 1 ;;
+    esac
+}
+
+# GTK4 runtime library check. Only the shared library is needed to run the
+# binary, so don't require the -dev/-devel package (pkg-config file).
+gtk4_runtime_present() {
+    local ldc out lib
+    for ldc in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+        if command -v "$ldc" &>/dev/null; then
+            # Capture first: `ldconfig -p | grep -q` can trip pipefail via SIGPIPE.
+            out="$("$ldc" -p 2>/dev/null || true)"
+            if [[ "$out" == *"libgtk-4.so.1"* ]]; then
+                return 0
+            fi
+            break
+        fi
+    done
+    for lib in /usr/lib/libgtk-4.so.1 /usr/lib64/libgtk-4.so.1 /usr/lib/*-linux-gnu/libgtk-4.so.1; do
+        [[ -e "$lib" ]] && return 0
+    done
+    pkg-config --exists gtk4 2>/dev/null
+}
+
+MISSING=()
+
+# notify-send (used for the "auto-paste unavailable" notification)
+command -v notify-send &>/dev/null || MISSING+=("notify-send")
 
 # xclip + xdotool always needed (fallback for GNOME Wayland via XWayland + X11)
-command -v xclip   &>/dev/null || { MISSING+=("xclip");   PACKAGES_TO_INSTALL+=("xclip"); }
-command -v xdotool &>/dev/null || { MISSING+=("xdotool"); PACKAGES_TO_INSTALL+=("xdotool"); }
+command -v xclip   &>/dev/null || MISSING+=("xclip")
+command -v xdotool &>/dev/null || MISSING+=("xdotool")
 
 if [[ "$SESSION_TYPE" == "wayland" || "$SESSION_TYPE" == "both" ]]; then
-    command -v wl-paste &>/dev/null || { MISSING+=("wl-paste"); PACKAGES_TO_INSTALL+=("wl-clipboard"); }
-    command -v wtype    &>/dev/null || { MISSING+=("wtype");    PACKAGES_TO_INSTALL+=("wtype"); }
+    command -v wl-paste &>/dev/null || MISSING+=("wl-paste")
+    command -v wtype    &>/dev/null || MISSING+=("wtype")
+    # ydotool is the primary auto-paste path on GNOME and KDE Wayland.
+    command -v ydotool  &>/dev/null || MISSING+=("ydotool")
 fi
 
-# Check GTK4 system library (needed by the Rust binary at runtime)
-if ! pkg-config --exists gtk4 2>/dev/null; then
-    MISSING+=("gtk4")
-    PACKAGES_TO_INSTALL+=("gtk4")
-fi
-
-# Deduplicate
-if [[ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ]]; then
-    PACKAGES_TO_INSTALL=($(printf '%s\n' "${PACKAGES_TO_INSTALL[@]}" | sort -u))
-fi
+# GTK4 system library (needed by the Rust binary at runtime)
+gtk4_runtime_present || MISSING+=("gtk4")
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     warn "Missing: ${MISSING[*]}"
-    echo "Packages needed: ${PACKAGES_TO_INSTALL[*]}"
+    if [[ -z "$PKG_MGR" ]]; then
+        error "No supported package manager found (pacman, apt-get, dnf, zypper).
+Please install these manually, then re-run: ${MISSING[*]}
+  (wl-paste comes from wl-clipboard, notify-send from libnotify, gtk4 is the GTK 4 runtime library)"
+    fi
+
+    PACKAGES_TO_INSTALL=()
+    for dep in "${MISSING[@]}"; do
+        PACKAGES_TO_INSTALL+=("$(pkg_name "$dep")")
+    done
+    # Deduplicate
+    mapfile -t PACKAGES_TO_INSTALL < <(printf '%s\n' "${PACKAGES_TO_INSTALL[@]}" | sort -u)
+
+    echo "Packages needed ($PKG_MGR): ${PACKAGES_TO_INSTALL[*]}"
     echo ""
-    read -rp "Auto-install now? [y/N] " answer
+    read -rp "Auto-install now? [y/N] " answer || answer=""
     if [[ "$answer" =~ ^[Yy]$ ]]; then
-        sudo pacman -S --needed --noconfirm "${PACKAGES_TO_INSTALL[@]}"
+        install_packages "${PACKAGES_TO_INSTALL[@]}" \
+            || error "Package installation failed. Install manually, then re-run: ${PACKAGES_TO_INSTALL[*]}"
         info "Dependencies installed."
     else
         error "Please install missing dependencies manually, then re-run."
@@ -132,22 +195,84 @@ else
     info "All runtime dependencies found."
 fi
 
-# ── 1b. Wayland auto-paste plumbing: ydotoold + input group ───────────────
+# ── 1b. Wayland auto-paste plumbing: /dev/uinput access + ydotoold ────────
 # On GNOME Wayland (and KDE Wayland), wtype often gets its events dropped
 # by the compositor, and auto-paste falls back to ydotool — which needs
-# two things that the Arch `ydotool` package does NOT set up for you:
+# two things most distro `ydotool` packages do NOT set up for you:
 #
-#   1. ydotoold must be running (user systemd unit: ydotool.service)
-#   2. The user must be in the `input` group to access /dev/uinput
+#   1. Write access to /dev/uinput (to create the virtual keyboard)
+#   2. ydotoold must be running (user systemd unit: ydotool.service)
 #
 # Without these the user sees a "Auto-paste unavailable" toast and has
 # no idea why. Fix it here, once.
 GROUP_ADDED=0
+UINPUT_CHANGED=0
+UDEV_RULE="/etc/udev/rules.d/60-copyninja-uinput.rules"
+MODULES_CONF="/etc/modules-load.d/copyninja-uinput.conf"
+
+# Grant the logged-in desktop user (via logind's uaccess ACL) access to
+# /dev/uinput only. Must sort before 73-seat-late.rules, which applies the ACL.
+install_uinput_rule() {
+    step "Installing udev rule $UDEV_RULE…"
+    if ! echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' \
+            | sudo tee "$UDEV_RULE" >/dev/null; then
+        warn "Could not write $UDEV_RULE."
+        return 1
+    fi
+    sudo modprobe uinput 2>/dev/null || warn "modprobe uinput failed (it may be built into the kernel)."
+    echo uinput | sudo tee "$MODULES_CONF" >/dev/null || true
+    sudo udevadm control --reload-rules || true
+    sudo udevadm trigger --name-match=uinput 2>/dev/null \
+        || sudo udevadm trigger --sysname-match=uinput 2>/dev/null \
+        || true
+    # udev applies the ACL asynchronously
+    sudo udevadm settle 2>/dev/null || true
+    UINPUT_CHANGED=1
+    info "Installed $UDEV_RULE"
+}
 
 if [[ "$SESSION_TYPE" == "wayland" || "$SESSION_TYPE" == "both" ]] && command -v ydotool &>/dev/null; then
     step "Configuring ydotool for auto-paste…"
 
-    # Enable the ydotoold user service if the unit exists and isn't already active.
+    # /dev/uinput access first — ydotoold can't start without it.
+    if [[ -w /dev/uinput ]]; then
+        info "/dev/uinput is writable — ydotool can send the paste keystroke."
+    else
+        echo "  ydotool needs write access to /dev/uinput to send the paste keystroke."
+        echo "  CopyNinja can install a udev rule ($UDEV_RULE) that gives the"
+        echo "  logged-in desktop user access to /dev/uinput only."
+        echo "  (Adding you to the 'input' group would also work, but that lets every"
+        echo "  program you run read all keyboards — a keylogging capability.)"
+        read -rp "  Install the udev rule now? [Y/n] " answer || answer=""
+        if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+            install_uinput_rule || true
+        fi
+
+        if [[ -w /dev/uinput ]]; then
+            info "/dev/uinput is now writable."
+        else
+            warn "/dev/uinput is still not writable for $USER."
+            echo "  Fallback: add $USER to the 'input' group."
+            echo "  WARNING: the 'input' group lets ANY program you run read every keystroke"
+            echo "  from every keyboard (a keylogging capability), not just write to /dev/uinput."
+            read -rp "  Add $USER to the 'input' group anyway? [y/N] " answer || answer=""
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                if id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx 'input'; then
+                    info "$USER is already in the 'input' group (log out and back in if it was added recently)."
+                elif sudo usermod -aG input "$USER"; then
+                    GROUP_ADDED=1
+                    info "Added $USER to 'input' group."
+                else
+                    warn "Failed to add $USER to 'input' group — auto-paste via ydotool will fail."
+                    echo "  Run manually: sudo usermod -aG input $USER"
+                fi
+            else
+                warn "Skipped — auto-paste via ydotool may not work. CopyNinja will still copy to the clipboard."
+            fi
+        fi
+    fi
+
+    # Enable the ydotoold user service if the unit exists.
     if systemctl --user list-unit-files 2>/dev/null | grep -q '^ydotool\.service'; then
         if ! systemctl --user is-active ydotool.service &>/dev/null; then
             systemctl --user enable --now ydotool.service 2>&1 | tail -1 || true
@@ -155,28 +280,18 @@ if [[ "$SESSION_TYPE" == "wayland" || "$SESSION_TYPE" == "both" ]] && command -v
                 info "Enabled and started ydotool.service (user unit)."
             else
                 warn "Failed to start ydotool.service — auto-paste via ydotool may not work."
+                echo "  Check: journalctl --user -u ydotool -n 20"
             fi
+        elif [[ "$UINPUT_CHANGED" == "1" ]]; then
+            systemctl --user restart ydotool.service || true
+            info "Restarted ydotool.service to pick up /dev/uinput access."
         else
             info "ydotool.service already running."
         fi
     else
-        warn "ydotool.service user unit not found — auto-paste via ydotool will be unavailable."
-        echo "  The 'ydotool' package on Arch installs the unit at /usr/lib/systemd/user/ydotool.service."
-        echo "  If it's missing, reinstall: sudo pacman -S ydotool"
-    fi
-
-    # Check input group membership — required for /dev/uinput access.
-    if ! id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx 'input'; then
-        step "Adding $USER to the 'input' group (needed for /dev/uinput)…"
-        if sudo usermod -aG input "$USER"; then
-            GROUP_ADDED=1
-            info "Added $USER to 'input' group."
-        else
-            warn "Failed to add $USER to 'input' group — auto-paste via ydotool will fail."
-            echo "  Run manually: sudo usermod -aG input $USER"
-        fi
-    else
-        info "$USER is already in the 'input' group."
+        warn "ydotool.service user unit not found — ydotoold (the ydotool daemon) must be running for auto-paste via ydotool."
+        echo "  Some distros don't ship a user unit for it. Start 'ydotoold' yourself"
+        echo "  (e.g. from your compositor's autostart), or create a user service for it."
     fi
 fi
 
@@ -226,27 +341,44 @@ else
             | head -n1 || true)"
     fi
 
+    # Only use the release if it's the same version as this checkout.
+    # Otherwise re-running install.sh after updating the code would quietly
+    # install the older release instead.
+    SKIP_RELEASE=""
+    if [[ -n "$ASSET_URL" && -n "$SOURCE_VERSION" && "${RELEASE_TAG#v}" != "$SOURCE_VERSION" ]]; then
+        if command -v cargo &>/dev/null; then
+            info "Latest release is ${RELEASE_TAG:-unknown}, but this checkout is v$SOURCE_VERSION — building it from source."
+            ASSET_URL=""
+            SKIP_RELEASE=1
+        else
+            warn "Latest release is ${RELEASE_TAG:-unknown}, but this checkout is v$SOURCE_VERSION and Rust isn't installed to build it."
+            warn "Installing the release for now. Install Rust (https://rustup.rs) and re-run ./install.sh to get v$SOURCE_VERSION."
+        fi
+    fi
+
     if [[ -n "$ASSET_URL" ]]; then
         info "Found release $RELEASE_TAG → $ASSET_NAME"
-        TMPDIR="$(mktemp -d)"
-        trap 'rm -rf "$TMPDIR"' EXIT
+        # Not named TMPDIR: that would overwrite (and later delete) the user's
+        # exported TMPDIR, breaking the cargo fallback build.
+        DL_DIR="$(mktemp -d)"
+        trap 'rm -rf "$DL_DIR"' EXIT
 
-        if curl -fsSL --retry 2 -o "$TMPDIR/$ASSET_NAME" "$ASSET_URL"; then
+        if curl -fsSL --retry 2 -o "$DL_DIR/$ASSET_NAME" "$ASSET_URL"; then
             # Optional integrity check — works if maintainer uploaded the .sha256 file.
             SHA_URL="${ASSET_URL}.sha256"
-            if curl -fsSL -o "$TMPDIR/$ASSET_NAME.sha256" "$SHA_URL" 2>/dev/null; then
-                if (cd "$TMPDIR" && sha256sum -c "$ASSET_NAME.sha256" >/dev/null 2>&1); then
+            if curl -fsSL -o "$DL_DIR/$ASSET_NAME.sha256" "$SHA_URL" 2>/dev/null; then
+                if (cd "$DL_DIR" && sha256sum -c "$ASSET_NAME.sha256" >/dev/null 2>&1); then
                     info "SHA256 verified."
                 else
                     warn "SHA256 mismatch — refusing to install this binary; will build from source."
-                    rm -rf "$TMPDIR"
+                    rm -rf "$DL_DIR"
                     BUILT_BINARY=""
                 fi
             fi
 
-            if [[ -f "$TMPDIR/$ASSET_NAME" ]]; then
-                tar -xzf "$TMPDIR/$ASSET_NAME" -C "$TMPDIR"
-                CANDIDATE="$TMPDIR/$BINARY_NAME"
+            if [[ -f "$DL_DIR/$ASSET_NAME" ]]; then
+                tar -xzf "$DL_DIR/$ASSET_NAME" -C "$DL_DIR"
+                CANDIDATE="$DL_DIR/$BINARY_NAME"
 
                 # Sanity-check: the binary must actually run on this system.
                 # If glibc is too old, `--version` will fail — we detect that
@@ -262,7 +394,7 @@ else
         else
             warn "Download failed — will build from source."
         fi
-    else
+    elif [[ -z "$SKIP_RELEASE" ]]; then
         warn "No release found (or no asset for $RUST_TARGET) — will build from source."
     fi
 fi
@@ -273,6 +405,30 @@ if [[ -z "$BUILT_BINARY" ]]; then
 
     if ! command -v cargo &>/dev/null; then
         error "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    fi
+
+    # Building (unlike running) needs the GTK4 development files + pkg-config.
+    if ! pkg-config --exists gtk4 2>/dev/null; then
+        case "$PKG_MGR" in
+            pacman)  BUILD_PKGS="gtk4 pkgconf base-devel" ;;
+            apt-get) BUILD_PKGS="libgtk-4-dev pkg-config build-essential" ;;
+            dnf)     BUILD_PKGS="gtk4-devel pkgconf-pkg-config gcc" ;;
+            zypper)  BUILD_PKGS="gtk4-devel pkg-config gcc" ;;
+            *)       BUILD_PKGS="" ;;
+        esac
+        if [[ -z "$BUILD_PKGS" ]]; then
+            error "Building from source needs the GTK4 development files (gtk4.pc), pkg-config and a C compiler. Install them, then re-run."
+        fi
+        warn "Building from source needs GTK4 development files: $BUILD_PKGS"
+        read -rp "Install them now? [y/N] " answer || answer=""
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            read -ra BUILD_PKG_LIST <<< "$BUILD_PKGS"
+            install_packages "${BUILD_PKG_LIST[@]}" \
+                || error "Package installation failed. Install manually, then re-run: $BUILD_PKGS"
+            info "Build dependencies installed."
+        else
+            error "Please install: $BUILD_PKGS, then re-run."
+        fi
     fi
 
     cd "$SCRIPT_DIR"
@@ -287,10 +443,32 @@ fi
 info "Binary ready: $(du -h "$BUILT_BINARY" | cut -f1)"
 
 # ── 3. Install binary ─────────────────────────────────────────────────────
+# Re-running install.sh upgrades in place, no uninstall needed.
 step "Installing binary to $INSTALL_DIR…"
 mkdir -p "$INSTALL_DIR"
-cp "$BUILT_BINARY" "$INSTALL_DIR/$BINARY_NAME"
-chmod +x "$INSTALL_DIR/$BINARY_NAME"
+TARGET_BIN="$INSTALL_DIR/$BINARY_NAME"
+PREVIOUS_VERSION=""
+if [[ -x "$TARGET_BIN" ]]; then
+    PREVIOUS_VERSION="$("$TARGET_BIN" --version 2>/dev/null | awk '{print $2}' || true)"
+fi
+
+# Copy next to the target, then rename over it. Writing into the existing
+# file fails with "Text file busy" while the daemon is running from it; a
+# rename just swaps the file, and the daemon picks up the new one when it's
+# restarted below.
+NEW_BIN="$INSTALL_DIR/.$BINARY_NAME.new.$$"
+if ! cp "$BUILT_BINARY" "$NEW_BIN" || ! chmod 755 "$NEW_BIN" || ! mv -f "$NEW_BIN" "$TARGET_BIN"; then
+    rm -f "$NEW_BIN"
+    error "Could not install $TARGET_BIN (is the disk full or the folder read-only?)"
+fi
+INSTALLED_VERSION="$("$TARGET_BIN" --version 2>/dev/null | awk '{print $2}' || true)"
+if [[ -z "$PREVIOUS_VERSION" ]]; then
+    info "Installed copyninja ${INSTALLED_VERSION:-?}."
+elif [[ "$PREVIOUS_VERSION" == "$INSTALLED_VERSION" ]]; then
+    info "Reinstalled copyninja $INSTALLED_VERSION."
+else
+    info "Upgraded copyninja $PREVIOUS_VERSION → ${INSTALLED_VERSION:-?}."
+fi
 
 # Clean up legacy Python scripts if present
 if [[ -f "$INSTALL_DIR/clipdaemon.py" ]]; then
@@ -307,7 +485,7 @@ mkdir -p "$SYSTEMD_DIR"
 cat > "$SYSTEMD_DIR/copyninja.service" << EOF
 [Unit]
 Description=CopyNinja — Clipboard History Daemon
-Documentation=https://github.com/Yogesh190602/CopyNinja
+Documentation=https://github.com/Yogesh190602/Copyninjaa
 PartOf=graphical-session.target
 After=graphical-session.target
 
@@ -319,11 +497,14 @@ RestartSec=3s
 Environment=RUST_LOG=info
 
 [Install]
-WantedBy=graphical-session.target
+# default.target: plain Hyprland/sway/i3 never activate graphical-session.target,
+# and the daemon waits for the display itself (retry loop).
+WantedBy=default.target graphical-session.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable copyninja.service
+# reenable (not enable) so existing installs pick up the new WantedBy= symlinks.
+systemctl --user reenable copyninja.service
 systemctl --user restart copyninja.service
 info "Daemon started and enabled on login."
 
@@ -424,8 +605,21 @@ setup_wm_keybinding() {
     fi
 
     if grep -qF "$COPYNINJA_MARKER" "$config_file" 2>/dev/null; then
-        # Update existing keybinding to point to the Rust binary
-        sed -i "/$COPYNINJA_MARKER/{N;d;}" "$config_file"
+        # Update existing keybinding: drop the marker, the bind line after it,
+        # and the blank line we added before it, so reinstalls don't pile up
+        # empty lines. `cat >` keeps symlinked dotfiles intact.
+        local tmp
+        tmp="$(mktemp)"
+        awk -v marker="$COPYNINJA_MARKER" '
+            index($0, marker) { skip = 1; hasheld = 0; next }
+            skip              { skip = 0; next }
+            {
+                if (hasheld) { print ""; hasheld = 0 }
+                if ($0 == "") { hasheld = 1 } else { print }
+            }
+            END { if (hasheld) print "" }
+        ' "$config_file" > "$tmp" && cat "$tmp" > "$config_file"
+        rm -f "$tmp"
         info "Updating existing keybinding in $config_file"
     fi
 
@@ -512,7 +706,7 @@ esac
 echo ""
 info "Installation complete!"
 echo ""
-echo "  Binary:         $INSTALL_DIR/$BINARY_NAME ($(du -h "$INSTALL_DIR/$BINARY_NAME" | cut -f1))"
+echo "  Binary:         $INSTALL_DIR/$BINARY_NAME (v${INSTALLED_VERSION:-?}, $(du -h "$INSTALL_DIR/$BINARY_NAME" | cut -f1))"
 echo "  Daemon status:  systemctl --user status copyninja"
 echo "  Live logs:      journalctl --user -u copyninja -f"
 echo "  History file:   ~/.clipboard_history.json"

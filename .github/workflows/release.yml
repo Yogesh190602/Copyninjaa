@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. v1.0.1). Must already exist as a git tag."
+        description: "Tag to release (e.g. v1.2.0). Must already exist as a git tag."
         required: true
 
 permissions:
@@ -28,6 +28,9 @@ jobs:
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the requested tag — not the default branch.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install system dependencies (GTK4)
         run: |

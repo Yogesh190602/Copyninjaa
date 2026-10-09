@@ -4,6 +4,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// The window that had focus before the picker opened.
+#[derive(Debug, Clone, Default)]
+pub struct Target {
+    /// Window class, if it could be detected.
+    pub class: Option<String>,
+    /// The window is an X11 (XWayland) window inside a Wayland session, so
+    /// xdotool can reach it.
+    pub xwayland: bool,
+}
+
 /// Write text to the system clipboard synchronously using wl-copy or xclip.
 /// Returns true if the clipboard was successfully set.
 pub fn write_clipboard_sync(text: &str) -> bool {
@@ -108,16 +118,16 @@ pub fn write_image_clipboard_sync(path: &Path, mime: &str) -> bool {
     false
 }
 
-/// Show a desktop notification when auto-paste is unavailable.
-pub fn notify_copy_only() {
+/// Show a desktop notification.
+pub fn notify(summary: &str, body: &str) {
     let _ = Command::new("notify-send")
-        .args(["-a", "CopyNinja", "Copied to clipboard", "Auto-paste unavailable"])
+        .args(["-a", "CopyNinja", summary, body])
         .spawn();
 }
 
-/// Get the currently focused window's class name.
+/// Detect the currently focused window.
 /// Called BEFORE the picker window opens, so focus is still on the previous window.
-pub fn get_focused_window_class() -> Option<String> {
+pub fn detect_target() -> Target {
     // Hyprland
     if let Ok(output) = Command::new("hyprctl")
         .args(["activewindow", "-j"])
@@ -128,7 +138,11 @@ pub fn get_focused_window_class() -> Option<String> {
                 if let Some(class) = json.get("class").and_then(|v| v.as_str()) {
                     if !class.is_empty() {
                         debug!("Pre-launch focused class (hyprctl): '{}'", class);
-                        return Some(class.to_string());
+                        let xwayland = json.get("xwayland").and_then(|v| v.as_bool()) == Some(true);
+                        return Target {
+                            class: Some(class.to_string()),
+                            xwayland,
+                        };
                     }
                 }
             }
@@ -147,33 +161,53 @@ pub fn get_focused_window_class() -> Option<String> {
             // "detection failed" rather than a real class name.
             if !class.is_empty() && class != "(null)" {
                 debug!("Pre-launch focused class (xdotool): '{}'", class);
-                return Some(class);
+                return Target {
+                    class: Some(class),
+                    xwayland: is_wayland(),
+                };
             }
-            debug!("xdotool returned invalid class '{}' (native Wayland window?)", class);
+            debug!(
+                "xdotool returned invalid class '{}' (native Wayland window?)",
+                class
+            );
         }
     }
 
-    None
-}
-
-/// Public wrapper so `picker/mod.rs` can call the terminal class check.
-pub fn is_terminal_class_pub(class: &str) -> bool {
-    is_terminal_class(class)
+    Target::default()
 }
 
 /// Check if a window class name belongs to a known terminal emulator.
-fn is_terminal_class(class: &str) -> bool {
+pub(crate) fn is_terminal_class(class: &str) -> bool {
     let class = class.to_lowercase();
 
     const TERMINALS: &[&str] = &[
-        "alacritty", "kitty", "foot", "wezterm", "ghostty",
-        "konsole", "tilix", "terminator", "sakura",
-        "guake", "yakuake", "tilda", "contour", "rio",
-        "xterm", "urxvt", "rxvt", "st", "st-256color",
-        "kgx", "ptyxis", "blackbox",
+        "alacritty",
+        "kitty",
+        "foot",
+        "wezterm",
+        "ghostty",
+        "konsole",
+        "tilix",
+        "terminator",
+        "sakura",
+        "guake",
+        "yakuake",
+        "tilda",
+        "contour",
+        "rio",
+        "xterm",
+        "urxvt",
+        "rxvt",
+        "st",
+        "st-256color",
+        "kgx",
+        "ptyxis",
+        "blackbox",
     ];
 
-    if TERMINALS.iter().any(|t| class == *t) {
+    // Also match reverse-DNS app IDs: "com.mitchellh.ghostty", "org.gnome.Ptyxis".
+    let short = class.rsplit('.').next().unwrap_or(&class);
+    if TERMINALS.iter().any(|t| class == *t || short == *t) {
         return true;
     }
 
@@ -182,17 +216,34 @@ fn is_terminal_class(class: &str) -> bool {
     class.contains("terminal") || class.contains("konsole") || class.contains("console")
 }
 
+fn is_wayland() -> bool {
+    std::env::var("XDG_SESSION_TYPE").is_ok_and(|s| s == "wayland")
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 /// Detect if we're running on GNOME Wayland.
 /// On GNOME Wayland, xdotool triggers a "Remote Desktop" permission dialog
 /// instead of actually pasting, so we must skip it entirely.
 fn is_gnome_wayland() -> bool {
-    let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let result = session == "wayland" && desktop.to_lowercase().contains("gnome");
+    let result = is_wayland() && desktop.to_lowercase().contains("gnome");
     if result {
         debug!("Detected GNOME Wayland — xdotool will be skipped");
     }
     result
+}
+
+/// xdotool only reaches X11 windows. On Wayland it still exits 0 when the
+/// target is a native Wayland window, so a "success" would hide the failure.
+fn xdotool_can_paste(wayland: bool, gnome_wayland: bool, target: &Target) -> bool {
+    !wayland || (target.xwayland && !gnome_wayland)
+}
+
+/// Typing text key by key is only safe for a single line of plain ASCII: a
+/// typed newline runs the command in a terminal (typing bypasses bracketed
+/// paste), and ydotool maps characters with a US keyboard layout.
+fn safe_to_type(text: &str, terminal: bool) -> bool {
+    !terminal && !text.is_empty() && text.chars().all(|c| c == ' ' || c.is_ascii_graphic())
 }
 
 /// Wait until the CopyNinja picker window no longer has focus.
@@ -217,7 +268,11 @@ fn wait_for_focus_loss() {
                     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                         if let Some(class) = json.get("class").and_then(|v| v.as_str()) {
                             if !class.to_lowercase().contains("copyninja") {
-                                debug!("Focus left picker after {}ms (hyprctl, active: '{}')", (i + 1) * 50, class);
+                                debug!(
+                                    "Focus left picker after {}ms (hyprctl, active: '{}')",
+                                    (i + 1) * 50,
+                                    class
+                                );
                                 return;
                             }
                             continue;
@@ -236,9 +291,15 @@ fn wait_for_focus_loss() {
             .output()
         {
             if output.status.success() {
-                let class = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                let class = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_lowercase();
                 if !class.contains("copyninja") {
-                    debug!("Focus left picker after {}ms (xdotool, active: '{}')", (i + 1) * 50, class);
+                    debug!(
+                        "Focus left picker after {}ms (xdotool, active: '{}')",
+                        (i + 1) * 50,
+                        class
+                    );
                     return;
                 }
             } else {
@@ -256,20 +317,48 @@ fn wait_for_focus_loss() {
     debug!("Focus poll timed out after 1s, proceeding anyway");
 }
 
+/// Send Ctrl+V (or Ctrl+Shift+V) through ydotool. Tries the ydotool 1.x
+/// keycode syntax, then the 0.1.x key-name syntax shipped by Debian/Ubuntu.
+fn ydotool_key(terminal: bool) -> bool {
+    // evdev keycodes: KEY_LEFTCTRL=29, KEY_LEFTSHIFT=42, KEY_V=47
+    let v1: &[&str] = if terminal {
+        &["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
+    } else {
+        &["key", "29:1", "47:1", "47:0", "29:0"]
+    };
+    let v0: &[&str] = if terminal {
+        &["key", "ctrl+shift+v"]
+    } else {
+        &["key", "ctrl+v"]
+    };
+    for args in [v1, v0] {
+        match Command::new("ydotool").args(args).output() {
+            Ok(output) if output.status.success() => return true,
+            Ok(output) => debug!("ydotool {:?} failed (status {})", args, output.status),
+            Err(_) => {
+                debug!("ydotool not found");
+                return false;
+            }
+        }
+    }
+    false
+}
+
 /// Simulate paste in the previously focused window.
 /// Fallback chain:
 ///   1. wtype Ctrl+V        — wlroots Wayland (Hyprland, Sway)
-///   2. xdotool Ctrl+V      — X11 only (skipped on GNOME Wayland)
-///   3. ydotool key Ctrl+V   — GNOME Wayland (instant paste via uinput)
-///   4. ydotool type         — fallback (types text char-by-char via uinput)
-///   5. copy-only notify     — total failure
+///   2. xdotool Ctrl+V      — X11, or XWayland windows (skipped on GNOME Wayland)
+///   3. ydotool key Ctrl+V  — GNOME/KDE Wayland (instant paste via uinput)
+///   4. ydotool type        — single-line ASCII text only (types it via uinput)
+///   5. copy-only notify    — total failure
 ///
 /// Uses Ctrl+Shift+V for terminal emulators in steps 1-3.
-pub fn simulate_paste(text: &str, terminal: bool) {
+pub fn simulate_paste(text: &str, terminal: bool, target: &Target) {
     // Wait for focus to return to the previous window.
     // The picker was just hidden, so the compositor needs time to refocus.
     wait_for_focus_loss();
 
+    let wayland = is_wayland();
     let gnome_wayland = is_gnome_wayland();
     if terminal {
         debug!("Terminal detected — will use Ctrl+Shift+V");
@@ -279,32 +368,22 @@ pub fn simulate_paste(text: &str, terminal: bool) {
     // Mutter doesn't fully support the wlroots virtual-keyboard-v1 protocol
     // that wtype uses, so wtype often reports success but no paste reaches
     // the focused window (especially for Ctrl+Shift+V into terminals).
-    // evdev keycodes: KEY_LEFTCTRL=29, KEY_LEFTSHIFT=42, KEY_V=47
     if gnome_wayland {
-        let ydotool_key_args: &[&str] = if terminal {
-            &["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
-        } else {
-            &["key", "29:1", "47:1", "47:0", "29:0"]
-        };
-        match Command::new("ydotool").args(ydotool_key_args).output() {
-            Ok(output) if output.status.success() => {
-                debug!("Auto-paste via ydotool key succeeded (GNOME Wayland priority)");
-                return;
-            }
-            Ok(output) => {
-                debug!("ydotool key failed on GNOME Wayland (status {}), falling through", output.status);
-            }
-            Err(_) => {
-                debug!("ydotool not found on GNOME Wayland, falling through to wtype");
-            }
+        if ydotool_key(terminal) {
+            debug!("Auto-paste via ydotool key succeeded (GNOME Wayland priority)");
+            return;
         }
+        debug!("ydotool key failed on GNOME Wayland, falling through to wtype");
     }
 
-    // 1. Try wtype (native Wayland — Hyprland, Sway, wlroots compositors)
+    // 1. Try wtype (native Wayland — Hyprland, Sway, wlroots compositors).
+    // Modifiers are released explicitly so none stays stuck.
     let wtype_args: &[&str] = if terminal {
-        &["-M", "ctrl", "-M", "shift", "-k", "v"]
+        &[
+            "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
+        ]
     } else {
-        &["-M", "ctrl", "-k", "v"]
+        &["-M", "ctrl", "-k", "v", "-m", "ctrl"]
     };
     match Command::new("wtype").args(wtype_args).output() {
         Ok(output) if output.status.success() => {
@@ -319,19 +398,18 @@ pub fn simulate_paste(text: &str, terminal: bool) {
         }
     }
 
-    // 2. Try xdotool (X11 only) — skip on GNOME Wayland where it
-    // triggers Remote Desktop dialog instead of pasting
-    if !gnome_wayland {
+    // 2. Try xdotool — only where it can actually reach the target window
+    if xdotool_can_paste(wayland, gnome_wayland, target) {
         std::thread::sleep(Duration::from_millis(50));
         let _ = Command::new("xdotool")
-            .args(["keyup", "super", "Super_L", "Super_R", "shift", "Shift_L", "Shift_R", "ctrl", "alt"])
+            .args([
+                "keyup", "super", "Super_L", "Super_R", "shift", "Shift_L", "Shift_R", "ctrl",
+                "alt",
+            ])
             .output();
         std::thread::sleep(Duration::from_millis(50));
         let xdotool_key = if terminal { "ctrl+shift+v" } else { "ctrl+v" };
-        match Command::new("xdotool")
-            .args(["key", xdotool_key])
-            .output()
-        {
+        match Command::new("xdotool").args(["key", xdotool_key]).output() {
             Ok(output) if output.status.success() => {
                 debug!("Auto-paste via xdotool succeeded");
                 return;
@@ -345,21 +423,38 @@ pub fn simulate_paste(text: &str, terminal: bool) {
         }
     }
 
-    // 3. ydotool key Ctrl+V (GNOME Wayland — instant paste from clipboard via uinput)
-    // evdev keycodes: KEY_LEFTCTRL=29, KEY_LEFTSHIFT=42, KEY_V=47
-    {
-        let ydotool_key_args: &[&str] = if terminal {
-            &["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
-        } else {
-            &["key", "29:1", "47:1", "47:0", "29:0"]
-        };
-        match Command::new("ydotool").args(ydotool_key_args).output() {
-            Ok(output) if output.status.success() => {
-                debug!("Auto-paste via ydotool key succeeded");
-                return;
-            }
-            Ok(output) => {
-                debug!("ydotool key failed (status {}), trying ydotool type", output.status);
+    // 3. ydotool key Ctrl+V (instant paste from clipboard via uinput)
+    if !gnome_wayland && ydotool_key(terminal) {
+        debug!("Auto-paste via ydotool key succeeded");
+        return;
+    }
+
+    // 4. ydotool type — only where typing can't run commands or garble text
+    if safe_to_type(text, terminal) {
+        match Command::new("ydotool")
+            .args(["type", "--key-delay", "0", "--key-hold", "0", "--file", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                    drop(stdin);
+                }
+                match child.wait() {
+                    Ok(status) if status.success() => {
+                        debug!("Auto-paste via ydotool type succeeded");
+                        return;
+                    }
+                    Ok(status) => {
+                        warn!("ydotool type failed (status {})", status);
+                    }
+                    Err(e) => {
+                        warn!("ydotool type wait failed ({})", e);
+                    }
+                }
             }
             Err(_) => {
                 debug!("ydotool not found");
@@ -367,37 +462,53 @@ pub fn simulate_paste(text: &str, terminal: bool) {
         }
     }
 
-    // 4. ydotool type (fallback — types text char-by-char via uinput, zero delays)
-    match Command::new("ydotool")
-        .args(["type", "--key-delay", "0", "--key-hold", "0", "--file", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-                drop(stdin);
-            }
-            match child.wait() {
-                Ok(status) if status.success() => {
-                    debug!("Auto-paste via ydotool type succeeded");
-                    return;
-                }
-                Ok(status) => {
-                    warn!("ydotool type failed (status {})", status);
-                }
-                Err(e) => {
-                    warn!("ydotool type wait failed ({})", e);
-                }
-            }
-        }
-        Err(_) => {
-            debug!("ydotool not found");
-        }
+    warn!("No paste tool worked (wtype/xdotool/ydotool) — copied to clipboard only");
+    notify(
+        "Copied to clipboard",
+        "Auto-paste is unavailable here. Press Ctrl+V to paste.",
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typing_fallback_never_types_risky_text() {
+        assert!(safe_to_type("hello world", false));
+        assert!(!safe_to_type("rm -rf ~\n", false), "newline would run it");
+        assert!(!safe_to_type("ls", true), "terminals get no typing");
+        assert!(!safe_to_type("héllo", false), "non-ASCII gets garbled");
+        assert!(!safe_to_type("", false), "images have no text");
     }
 
-    warn!("No paste tool available (wtype/xdotool/ydotool) — copied to clipboard only");
-    notify_copy_only();
+    #[test]
+    fn xdotool_only_where_it_reaches_the_window() {
+        let native = Target::default();
+        let xwayland = Target {
+            class: Some("steam".into()),
+            xwayland: true,
+        };
+        assert!(xdotool_can_paste(false, false, &native), "X11 session");
+        assert!(
+            !xdotool_can_paste(true, false, &native),
+            "KDE Wayland, native window"
+        );
+        assert!(
+            xdotool_can_paste(true, false, &xwayland),
+            "KDE Wayland, XWayland window"
+        );
+        assert!(
+            !xdotool_can_paste(true, true, &xwayland),
+            "GNOME shows a dialog instead"
+        );
+    }
+
+    #[test]
+    fn terminal_classes() {
+        assert!(is_terminal_class("org.gnome.Ptyxis"));
+        assert!(is_terminal_class("Alacritty"));
+        assert!(is_terminal_class("gnome-terminal-server"));
+        assert!(!is_terminal_class("firefox"));
+    }
 }

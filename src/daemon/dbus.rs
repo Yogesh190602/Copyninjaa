@@ -8,7 +8,7 @@ struct CopyNinjaDaemon;
 impl CopyNinjaDaemon {
     async fn new_entry(&self, text: String) {
         info!("D-Bus NewEntry received ({} chars)", text.len());
-        crate::storage::process_text(&text);
+        super::blocking(move || crate::storage::process_text(&text)).await;
     }
 }
 
