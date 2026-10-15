@@ -1,6 +1,6 @@
 [package]
 name = "copyninja"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 # std::fs::File::lock (history file locking) needs 1.89
 rust-version = "1.89"
@@ -24,6 +24,7 @@ anyhow = "1"
 toml = "0.8"
 notify = { version = "7", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+x11rb = { version = "0.13", default-features = false, features = ["xfixes"] }
 
 [dev-dependencies]
 tempfile = "3"
