@@ -56,13 +56,17 @@ DESKTOP="${XDG_CURRENT_DESKTOP:-unknown}"
 echo "  session: $SESSION ($DESKTOP)"
 
 if [[ "$SESSION" == "wayland" && "$DESKTOP" == *GNOME* ]]; then
-    check "config at ~/.config/copyninja/config.toml" \
-          "[ -f \"$HOME/.config/copyninja/config.toml\" ]" \
-          "re-run ./install.sh (required on GNOME Wayland for terminal paste)"
-    if [ -f "$HOME/.config/copyninja/config.toml" ]; then
-        MODE=$(grep -oE 'paste_mode\s*=\s*"[a-z]+"' "$HOME/.config/copyninja/config.toml" 2>/dev/null | head -1)
-        [ -n "$MODE" ] && echo "        current: $MODE"
-    fi
+    # GNOME hides the focused window, so only "auto" (Shift+Insert) pastes
+    # into both terminals and text editors.
+    MODE=$(grep -oE '^\s*paste_mode\s*=\s*"[a-z]+"' "$HOME/.config/copyninja/config.toml" 2>/dev/null \
+        | head -1 | grep -oE '"[a-z]+"' | tr -d '"')
+    case "$MODE" in
+        terminal) warn "paste_mode = \"terminal\" (always Ctrl+Shift+V)" \
+                       "text editors and other GTK apps ignore it — set paste_mode = \"auto\" to paste with Shift+Insert, which works in terminals too" ;;
+        normal)   warn "paste_mode = \"normal\" (always Ctrl+V)" \
+                       "terminals ignore it — set paste_mode = \"auto\" to paste with Shift+Insert, which works in text fields too" ;;
+        *)        pass "paste_mode = auto (Shift+Insert: pastes in terminals and text fields)" ;;
+    esac
 fi
 
 # The binary logs config problems (bad values, unknown keys) as WARN lines on

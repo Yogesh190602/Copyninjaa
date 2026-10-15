@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.1] - 2026-10-15
+
+### Fixed
+- Auto-paste did nothing in GNOME Text Editor and other GTK apps on GNOME Wayland. The focused window can't be identified there, and `install.sh` set `paste_mode = "terminal"`, which sends Ctrl+Shift+V. `paste_mode = "auto"` now pastes with Shift+Insert when the window is unknown (also putting the text in the primary selection, which terminals paste on Shift+Insert), so the same setting works in terminals and text editors
+- `install.sh` no longer writes `paste_mode = "terminal"` on GNOME Wayland, and switches the config it generated before to `"auto"`; `doctor.sh` warns when GNOME Wayland is set to `"terminal"` or `"normal"`
+
 ## [1.2.0] - 2026-10-09
 
 ### Added

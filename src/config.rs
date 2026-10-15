@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PasteMode {
-    /// Detect whether the focused window is a terminal.
+    /// Detect whether the focused window is a terminal. Shift+Insert (which
+    /// pastes in both) when the window can't be identified.
     #[default]
     Auto,
     /// Always Ctrl+Shift+V.
