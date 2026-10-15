@@ -40,7 +40,7 @@ pub fn command(program: &str) -> tokio::process::Command {
 }
 
 /// Look up a variable, preferring the discovered ones.
-fn var(key: &str) -> Option<String> {
+pub fn var(key: &str) -> Option<String> {
     let imported = IMPORTED
         .lock()
         .unwrap()

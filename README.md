@@ -6,7 +6,7 @@ Supports **text and images**, **cross-device sync**, and a **runtime config file
 
 ## Features
 
-- **Clipboard monitoring** — event-driven on Wayland (`wl-paste --watch`), polling on X11 (`xclip`)
+- **Clipboard monitoring** — event-driven everywhere: `wl-paste --watch` on wlroots compositors and KDE, X11 change notifications (XFixes) on X11 and on GNOME Wayland through XWayland. No polling, so it costs nothing while idle
 - **Text & image support** — captures both text and images (PNG, JPEG, WebP, GIF, BMP) from clipboard
 - **GTK4 picker** — keyboard-first, full-text search with highlighted matches, image thumbnails, color swatches for color codes, and tidy previews for links and file paths
 - **Themes** — 13 built-in themes (Catppuccin, Tokyo Night, Dracula, Nord, Gruvbox, Rosé Pine, Adwaita), `auto` light/dark switching, custom colors, fonts, size and transparency, plus your own `style.css`
@@ -298,7 +298,7 @@ copyninja-rs/
 │   │   ├── mod.rs            # Daemon orchestration + retry loop
 │   │   ├── session.rs        # Wayland/X11 session detection
 │   │   ├── wayland.rs        # wl-paste --watch + MIME type detection
-│   │   ├── x11.rs            # xclip polling + MIME type detection
+│   │   ├── x11.rs            # XFixes change events + xclip reads + MIME type detection
 │   │   └── dbus.rs           # D-Bus service
 │   └── picker/
 │       ├── mod.rs            # Picker entry point

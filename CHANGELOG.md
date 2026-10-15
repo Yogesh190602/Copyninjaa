@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.2] - 2026-10-15
+
+### Changed
+- On X11 and GNOME Wayland the daemon now waits for the X server to report clipboard changes (XFixes) instead of running `xclip` twice every 500 ms. Idle CPU use drops from about 4% of a core to zero, clips are stored within a few milliseconds instead of up to half a second later, quick successive copies are no longer missed, and copying the same text again moves it back to the top. Polling remains as a fallback when the X server lacks XFixes
+
 ## [1.2.1] - 2026-10-15
 
 ### Fixed
