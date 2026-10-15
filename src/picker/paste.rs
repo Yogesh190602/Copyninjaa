@@ -1,3 +1,4 @@
+use crate::config::PasteMode;
 use log::{debug, warn};
 use std::io::Write;
 use std::path::Path;
@@ -14,11 +15,84 @@ pub struct Target {
     pub xwayland: bool,
 }
 
+/// The shortcut that pastes in the target window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteKeys {
+    /// Ctrl+V, for GUI apps.
+    CtrlV,
+    /// Ctrl+Shift+V, for terminals.
+    CtrlShiftV,
+    /// Shift+Insert, for when the window can't be identified (GNOME and KDE
+    /// Wayland). GTK, Qt, Firefox, Chromium and Electron apps paste the
+    /// clipboard with it, and terminals paste the primary selection, so the
+    /// text has to be put in both.
+    ShiftInsert,
+}
+
+impl PasteKeys {
+    /// The shortcut for the configured mode and the window being pasted into.
+    pub fn choose(mode: PasteMode, target: &Target) -> Self {
+        match mode {
+            PasteMode::Terminal => Self::CtrlShiftV,
+            PasteMode::Normal => Self::CtrlV,
+            PasteMode::Auto => match target.class.as_deref() {
+                Some(class) if is_terminal_class(class) => Self::CtrlShiftV,
+                Some(_) => Self::CtrlV,
+                None => Self::ShiftInsert,
+            },
+        }
+    }
+
+    /// ydotool 1.x key events (evdev keycodes: KEY_LEFTCTRL=29,
+    /// KEY_LEFTSHIFT=42, KEY_V=47, KEY_INSERT=110).
+    fn ydotool_events(self) -> &'static [&'static str] {
+        match self {
+            Self::CtrlV => &["29:1", "47:1", "47:0", "29:0"],
+            Self::CtrlShiftV => &["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
+            Self::ShiftInsert => &["42:1", "110:1", "110:0", "42:0"],
+        }
+    }
+
+    /// Key combo for xdotool and ydotool 0.1.x.
+    fn combo(self) -> &'static str {
+        match self {
+            Self::CtrlV => "ctrl+v",
+            Self::CtrlShiftV => "ctrl+shift+v",
+            Self::ShiftInsert => "shift+Insert",
+        }
+    }
+
+    /// wtype arguments. Modifiers are released explicitly so none stays stuck.
+    fn wtype_args(self) -> &'static [&'static str] {
+        match self {
+            Self::CtrlV => &["-M", "ctrl", "-k", "v", "-m", "ctrl"],
+            Self::CtrlShiftV => &[
+                "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
+            ],
+            Self::ShiftInsert => &["-M", "shift", "-k", "Insert", "-m", "shift"],
+        }
+    }
+}
+
 /// Write text to the system clipboard synchronously using wl-copy or xclip.
 /// Returns true if the clipboard was successfully set.
 pub fn write_clipboard_sync(text: &str) -> bool {
+    write_text_sync(text, false)
+}
+
+/// Write text to the primary selection, which terminals paste on Shift+Insert.
+/// Returns true if it was successfully set.
+pub fn write_primary_sync(text: &str) -> bool {
+    write_text_sync(text, true)
+}
+
+fn write_text_sync(text: &str, primary: bool) -> bool {
+    let name = if primary { "primary" } else { "clipboard" };
+
     // Try wl-copy (Wayland) — blocks until compositor accepts
+    let wl_args: &[&str] = if primary { &["--primary"] } else { &[] };
     if let Ok(mut child) = Command::new("wl-copy")
+        .args(wl_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -30,7 +104,7 @@ pub fn write_clipboard_sync(text: &str) -> bool {
         }
         if let Ok(status) = child.wait() {
             if status.success() {
-                debug!("Clipboard set via wl-copy (sync)");
+                debug!("{} set via wl-copy (sync)", name);
                 return true;
             }
         }
@@ -41,7 +115,7 @@ pub fn write_clipboard_sync(text: &str) -> bool {
 
     // Fallback: xclip (X11/XWayland)
     if let Ok(mut child) = Command::new("xclip")
-        .args(["-selection", "clipboard"])
+        .args(["-selection", name])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -53,13 +127,13 @@ pub fn write_clipboard_sync(text: &str) -> bool {
         }
         if let Ok(status) = child.wait() {
             if status.success() {
-                debug!("Clipboard set via xclip (sync)");
+                debug!("{} set via xclip (sync)", name);
                 return true;
             }
         }
     }
 
-    warn!("Both wl-copy and xclip failed to set clipboard");
+    warn!("Both wl-copy and xclip failed to set the {}", name);
     false
 }
 
@@ -317,21 +391,12 @@ fn wait_for_focus_loss() {
     debug!("Focus poll timed out after 1s, proceeding anyway");
 }
 
-/// Send Ctrl+V (or Ctrl+Shift+V) through ydotool. Tries the ydotool 1.x
-/// keycode syntax, then the 0.1.x key-name syntax shipped by Debian/Ubuntu.
-fn ydotool_key(terminal: bool) -> bool {
-    // evdev keycodes: KEY_LEFTCTRL=29, KEY_LEFTSHIFT=42, KEY_V=47
-    let v1: &[&str] = if terminal {
-        &["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
-    } else {
-        &["key", "29:1", "47:1", "47:0", "29:0"]
-    };
-    let v0: &[&str] = if terminal {
-        &["key", "ctrl+shift+v"]
-    } else {
-        &["key", "ctrl+v"]
-    };
-    for args in [v1, v0] {
+/// Send the paste shortcut through ydotool. Tries the ydotool 1.x keycode
+/// syntax, then the 0.1.x key-name syntax shipped by Debian/Ubuntu.
+fn ydotool_key(keys: PasteKeys) -> bool {
+    let v1 = [&["key"][..], keys.ydotool_events()].concat();
+    let v0 = ["key", keys.combo()];
+    for args in [&v1[..], &v0[..]] {
         match Command::new("ydotool").args(args).output() {
             Ok(output) if output.status.success() => return true,
             Ok(output) => debug!("ydotool {:?} failed (status {})", args, output.status),
@@ -346,30 +411,29 @@ fn ydotool_key(terminal: bool) -> bool {
 
 /// Simulate paste in the previously focused window.
 /// Fallback chain:
-///   1. wtype Ctrl+V        — wlroots Wayland (Hyprland, Sway)
-///   2. xdotool Ctrl+V      — X11, or XWayland windows (skipped on GNOME Wayland)
-///   3. ydotool key Ctrl+V  — GNOME/KDE Wayland (instant paste via uinput)
-///   4. ydotool type        — single-line ASCII text only (types it via uinput)
-///   5. copy-only notify    — total failure
+///   0. ydotool key   — GNOME Wayland only, tried first
+///   1. wtype         — wlroots Wayland (Hyprland, Sway)
+///   2. xdotool       — X11, or XWayland windows (skipped on GNOME Wayland)
+///   3. ydotool key   — KDE and other Wayland compositors (via uinput)
+///   4. ydotool type  — single-line ASCII text only (types it via uinput)
+///   5. copy-only notify — total failure
 ///
-/// Uses Ctrl+Shift+V for terminal emulators in steps 1-3.
-pub fn simulate_paste(text: &str, terminal: bool, target: &Target) {
+/// Steps 0-3 send `keys`.
+pub fn simulate_paste(text: &str, keys: PasteKeys, target: &Target) {
     // Wait for focus to return to the previous window.
     // The picker was just hidden, so the compositor needs time to refocus.
     wait_for_focus_loss();
 
     let wayland = is_wayland();
     let gnome_wayland = is_gnome_wayland();
-    if terminal {
-        debug!("Terminal detected — will use Ctrl+Shift+V");
-    }
+    debug!("Pasting with {:?}", keys);
 
     // On GNOME Wayland, try ydotool key FIRST.
     // Mutter doesn't fully support the wlroots virtual-keyboard-v1 protocol
     // that wtype uses, so wtype often reports success but no paste reaches
     // the focused window (especially for Ctrl+Shift+V into terminals).
     if gnome_wayland {
-        if ydotool_key(terminal) {
+        if ydotool_key(keys) {
             debug!("Auto-paste via ydotool key succeeded (GNOME Wayland priority)");
             return;
         }
@@ -377,15 +441,7 @@ pub fn simulate_paste(text: &str, terminal: bool, target: &Target) {
     }
 
     // 1. Try wtype (native Wayland — Hyprland, Sway, wlroots compositors).
-    // Modifiers are released explicitly so none stays stuck.
-    let wtype_args: &[&str] = if terminal {
-        &[
-            "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
-        ]
-    } else {
-        &["-M", "ctrl", "-k", "v", "-m", "ctrl"]
-    };
-    match Command::new("wtype").args(wtype_args).output() {
+    match Command::new("wtype").args(keys.wtype_args()).output() {
         Ok(output) if output.status.success() => {
             debug!("Auto-paste via wtype succeeded");
             return;
@@ -408,8 +464,7 @@ pub fn simulate_paste(text: &str, terminal: bool, target: &Target) {
             ])
             .output();
         std::thread::sleep(Duration::from_millis(50));
-        let xdotool_key = if terminal { "ctrl+shift+v" } else { "ctrl+v" };
-        match Command::new("xdotool").args(["key", xdotool_key]).output() {
+        match Command::new("xdotool").args(["key", keys.combo()]).output() {
             Ok(output) if output.status.success() => {
                 debug!("Auto-paste via xdotool succeeded");
                 return;
@@ -423,14 +478,14 @@ pub fn simulate_paste(text: &str, terminal: bool, target: &Target) {
         }
     }
 
-    // 3. ydotool key Ctrl+V (instant paste from clipboard via uinput)
-    if !gnome_wayland && ydotool_key(terminal) {
+    // 3. ydotool key (instant paste from clipboard via uinput)
+    if !gnome_wayland && ydotool_key(keys) {
         debug!("Auto-paste via ydotool key succeeded");
         return;
     }
 
     // 4. ydotool type — only where typing can't run commands or garble text
-    if safe_to_type(text, terminal) {
+    if safe_to_type(text, keys == PasteKeys::CtrlShiftV) {
         match Command::new("ydotool")
             .args(["type", "--key-delay", "0", "--key-hold", "0", "--file", "-"])
             .stdin(Stdio::piped())
@@ -502,6 +557,51 @@ mod tests {
             !xdotool_can_paste(true, true, &xwayland),
             "GNOME shows a dialog instead"
         );
+    }
+
+    #[test]
+    fn paste_keys_follow_mode_and_target() {
+        let unknown = Target::default();
+        let class = |c: &str| Target {
+            class: Some(c.into()),
+            xwayland: false,
+        };
+        let auto = |t: &Target| PasteKeys::choose(PasteMode::Auto, t);
+        assert_eq!(auto(&class("com.mitchellh.ghostty")), PasteKeys::CtrlShiftV);
+        assert_eq!(auto(&class("org.gnome.TextEditor")), PasteKeys::CtrlV);
+        assert_eq!(
+            auto(&unknown),
+            PasteKeys::ShiftInsert,
+            "GNOME Wayland: works in terminals and text fields"
+        );
+        assert_eq!(
+            PasteKeys::choose(PasteMode::Terminal, &unknown),
+            PasteKeys::CtrlShiftV
+        );
+        assert_eq!(
+            PasteKeys::choose(PasteMode::Normal, &class("kitty")),
+            PasteKeys::CtrlV
+        );
+    }
+
+    #[test]
+    fn ydotool_events_release_every_key_in_reverse() {
+        for keys in [
+            PasteKeys::CtrlV,
+            PasteKeys::CtrlShiftV,
+            PasteKeys::ShiftInsert,
+        ] {
+            let events = keys.ydotool_events();
+            let (presses, releases) = events.split_at(events.len() / 2);
+            let pressed: Vec<_> = presses.iter().map(|e| e.strip_suffix(":1")).collect();
+            let released: Vec<_> = releases
+                .iter()
+                .rev()
+                .map(|e| e.strip_suffix(":0"))
+                .collect();
+            assert!(pressed.iter().all(Option::is_some), "{:?}", keys);
+            assert_eq!(pressed, released, "{:?}", keys);
+        }
     }
 
     #[test]

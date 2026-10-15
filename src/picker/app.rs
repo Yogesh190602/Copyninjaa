@@ -1,7 +1,7 @@
 use crate::config::Appearance;
 use crate::content::ClipContent;
 use crate::picker::css;
-use crate::picker::paste::{self, Target};
+use crate::picker::paste::{self, PasteKeys, Target};
 use crate::picker::preview::{self, Kind, MarkupStyle};
 use crate::storage::{self, ClipEntry};
 use crate::theme::{self, Palette};
@@ -20,7 +20,7 @@ use std::time::Duration;
 const THUMB_W: i32 = 60;
 const THUMB_H: i32 = 44;
 
-pub fn run(auto_paste: bool, target_is_terminal: bool, target: Target, appearance: Appearance) {
+pub fn run(auto_paste: bool, keys: PasteKeys, target: Target, appearance: Appearance) {
     let app = gtk4::Application::builder()
         .application_id("com.copyninja.picker")
         .build();
@@ -36,13 +36,7 @@ pub fn run(auto_paste: bool, target_is_terminal: bool, target: Target, appearanc
             }
             return;
         }
-        let built = Picker::build(
-            app,
-            auto_paste,
-            target_is_terminal,
-            target.clone(),
-            &appearance,
-        );
+        let built = Picker::build(app, auto_paste, keys, target.clone(), &appearance);
         *picker.borrow_mut() = Some(built);
     });
     app.run_with_args::<String>(&[]);
@@ -102,7 +96,7 @@ struct Picker {
     is_pasting: Cell<bool>,
 
     auto_paste: bool,
-    target_is_terminal: bool,
+    keys: PasteKeys,
     target: Target,
 }
 
@@ -110,7 +104,7 @@ impl Picker {
     fn build(
         app: &gtk4::Application,
         auto_paste: bool,
-        target_is_terminal: bool,
+        keys: PasteKeys,
         target: Target,
         appearance: &Appearance,
     ) -> Rc<Self> {
@@ -227,7 +221,7 @@ impl Picker {
             status_generation: Cell::new(0),
             is_pasting: Cell::new(false),
             auto_paste,
-            target_is_terminal,
+            keys,
             target,
         });
         picker.connect_signals();
@@ -662,18 +656,26 @@ impl Picker {
         };
 
         // Write to clipboard based on content type.
-        // For images, force non-terminal paste mode: Ctrl+Shift+V never pastes
-        // images in any common app (terminals don't accept images, GTK apps
-        // treat it as Unicode entry, image editors ignore it). Ctrl+V is the
-        // only shortcut that actually pastes image data.
-        let (text_for_paste, paste_as_terminal) = match entry.resolved_content() {
+        // Images always paste with Ctrl+V: it's the only shortcut that pastes
+        // image data (terminals don't accept images, and Ctrl+Shift+V and
+        // Shift+Insert paste text only).
+        let (text_for_paste, keys) = match entry.resolved_content() {
             ClipContent::Text { text, .. } => {
                 if !paste::write_clipboard_sync(&text) {
                     if let Some(display) = gdk4::Display::default() {
                         display.clipboard().set_text(&text);
                     }
                 }
-                (text, self.target_is_terminal)
+                let mut keys = self.keys;
+                // Terminals paste the primary selection on Shift+Insert. If
+                // it can't be set they'd paste an old selection instead.
+                if self.auto_paste
+                    && keys == PasteKeys::ShiftInsert
+                    && !paste::write_primary_sync(&text)
+                {
+                    keys = PasteKeys::CtrlV;
+                }
+                (text, keys)
             }
             ClipContent::Image { path, mime } => {
                 // Pasting now would paste whatever was on the clipboard before.
@@ -683,7 +685,7 @@ impl Picker {
                     );
                     return;
                 }
-                (String::new(), false)
+                (String::new(), PasteKeys::CtrlV)
             }
         };
 
@@ -704,7 +706,7 @@ impl Picker {
         let target = self.target.clone();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
-            paste::simulate_paste(&text_for_paste, paste_as_terminal, &target);
+            paste::simulate_paste(&text_for_paste, keys, &target);
             let _ = tx.send(());
         });
         // Poll from GLib main loop until paste thread completes (or dies)

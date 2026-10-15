@@ -12,7 +12,7 @@ Supports **text and images**, **cross-device sync**, and a **runtime config file
 - **Themes** — 13 built-in themes (Catppuccin, Tokyo Night, Dracula, Nord, Gruvbox, Rosé Pine, Adwaita), `auto` light/dark switching, custom colors, fonts, size and transparency, plus your own `style.css`
 - **Pin entries** — keep frequently used snippets at the top (protected from pruning)
 - **Auto-paste** — pastes into the previously focused window after selection (configurable)
-- **Terminal-aware** — uses Ctrl+Shift+V in terminals, Ctrl+V elsewhere
+- **Terminal-aware** — uses Ctrl+Shift+V in terminals, Ctrl+V elsewhere, and Shift+Insert (which pastes in both) where the focused window can't be identified, like on GNOME Wayland
 - **Deduplication** — duplicate content is moved to the top, not stored twice
 - **Cross-device sync** — optional file-based sync via Syncthing, Nextcloud, or any cloud folder
 - **Crash recovery** — automatic backup rotation, recovers from corrupt history files
@@ -34,7 +34,7 @@ Daemon (copyninja daemon)             Picker (copyninja pick)
  - optional sync watcher               - writes tombstones for sync deletes
 ```
 
-**Auto-paste fallback chain** (modifier depends on `paste_mode`: `Ctrl+V` for normal, `Ctrl+Shift+V` for terminal):
+**Auto-paste fallback chain** (the shortcut sent depends on [`paste_mode`](#paste-mode)):
 
 | Priority | Tool | Environment |
 |----------|------|-------------|
@@ -75,7 +75,7 @@ This will:
 3. Set up the systemd user service (starts at login on every desktop, including plain Hyprland/Sway/i3)
 4. Configure the Super+Shift+V keybinding for your DE
 5. On **Wayland**, offer to install a udev rule giving your desktop session write access to `/dev/uinput`, which `ydotool` needs to send the paste keystroke. This grants access to `/dev/uinput` only; the old approach of joining the `input` group would let every program read all keyboards, so it's only offered as a fallback.
-6. On **GNOME Wayland only**, create a default `~/.config/copyninja/config.toml` with `paste_mode = "terminal"` — because auto-detection is impossible on GNOME Wayland (see [Paste mode](#paste-mode) below). Never overwrites an existing config.
+6. If an older version of the installer created `~/.config/copyninja/config.toml` on GNOME Wayland with `paste_mode = "terminal"`, switch it to `"auto"` (see [Paste mode](#paste-mode) below). A config you wrote or edited yourself is left alone.
 
 ### Update
 
@@ -229,28 +229,24 @@ Controls which keyboard shortcut the auto-paste simulates:
 
 | Value | Shortcut | When to use |
 |-------|----------|-------------|
-| `"auto"` *(default)* | Detects focused window class — `Ctrl+Shift+V` in terminals, `Ctrl+V` elsewhere | Most wlroots compositors (Hyprland, Sway) |
-| `"terminal"` | Always `Ctrl+Shift+V` | GNOME Wayland users who mainly paste into terminals (see note below) |
-| `"normal"` | Always `Ctrl+V` | GNOME Wayland users who mainly paste into text fields / browsers |
+| `"auto"` *(default)* | Detects the focused window — `Ctrl+Shift+V` in terminals, `Ctrl+V` elsewhere, `Shift+Insert` when the window can't be identified | Everyone, unless one of the cases below applies |
+| `"terminal"` | Always `Ctrl+Shift+V` | You only ever paste into terminals |
+| `"normal"` | Always `Ctrl+V` | You never paste into terminals |
 
-#### ⚠️ GNOME Wayland users — read this
+#### GNOME Wayland
 
-On **GNOME Wayland**, `"auto"` detection **does not work for native Wayland terminals** (Ghostty, GNOME Console/kgx, kitty, alacritty, etc.). Mutter does not expose the focused window class to external apps — `xdotool` returns `(null)` and `org.gnome.Shell.Introspect.GetWindows` is blocked (`AccessDenied`) on recent GNOME versions. Without a shell extension like *Window Calls*, no public API can identify the focused window.
+On **GNOME Wayland** (and for native Wayland windows on KDE), other apps can't find out which window is focused: Mutter doesn't expose it, `xdotool` returns `(null)`, and `org.gnome.Shell.Introspect.GetWindows` is blocked (`AccessDenied`). So `"auto"` can't tell a terminal from a text editor there.
 
-As a result, `paste_mode = "auto"` will silently default to `Ctrl+V` for native Wayland windows, which terminals ignore — **auto-paste appears to do nothing**.
+Instead it pastes with **`Shift+Insert`**, which works in both:
 
-**Fix:** explicitly set the mode. For terminal-heavy workflows:
+- GTK (GNOME Text Editor, gedit, …), Qt, Firefox, Chromium, Electron apps (VS Code, Slack), LibreOffice and JetBrains IDEs paste the clipboard with `Shift+Insert`.
+- Terminals (Ghostty, GNOME Console, GNOME Terminal, Ptyxis, kitty, Alacritty, foot, WezTerm, Konsole) paste the *primary selection* with `Shift+Insert`, so CopyNinja puts the text in the primary selection too. (This replaces whatever text you last highlighted with the mouse.)
 
-```bash
-mkdir -p ~/.config/copyninja
-cat > ~/.config/copyninja/config.toml <<'EOF'
-paste_mode = "terminal"
-EOF
-```
+Images always paste with `Ctrl+V`, the only shortcut that pastes image data.
 
-Tradeoff for `"terminal"` mode: `Ctrl+Shift+V` works in terminals and in most browsers (as "paste without formatting"), but in GTK text fields it opens the Unicode entry dialog instead of pasting, and in VS Code it toggles Markdown preview. If that bothers you, use `"normal"` mode instead and accept that terminal paste won't work — or file an issue asking for per-keybinding `--terminal` / `--normal` CLI flags.
+Leave `paste_mode = "auto"` on GNOME. Older versions of `install.sh` set `"terminal"` there, which sends `Ctrl+Shift+V` and doesn't paste into text editors and other GTK apps; re-running `./install.sh` switches that generated config back to `"auto"`, and `./doctor.sh` tells you if a mode other than `"auto"` is set.
 
-On **wlroots compositors** (Hyprland, Sway) and **X11 sessions**, leave `paste_mode = "auto"` — detection works correctly there.
+On **wlroots compositors** (Hyprland, Sway) and **X11 sessions**, the focused window is detected, so `"auto"` uses `Ctrl+V` or `Ctrl+Shift+V` as appropriate.
 
 ## Cross-Device Sync
 
@@ -329,9 +325,9 @@ Release binaries are built by GitHub Actions (`.github/workflows/release.yml`) w
 
 ## Known Limitations
 
-- **GNOME Wayland terminal detection** — auto-detection of focused native Wayland terminals is impossible without a shell extension. Set `paste_mode = "terminal"` in `~/.config/copyninja/config.toml` if auto-paste silently fails in your terminal. See [Paste mode](#paste-mode) for details.
+- **GNOME Wayland window detection** — the focused window can't be identified without a shell extension, so auto-paste uses `Shift+Insert` there and also sets the primary selection. An app that doesn't paste on `Shift+Insert` needs `paste_mode = "normal"` (or `"terminal"`). See [Paste mode](#paste-mode) for details.
 - **GNOME/KDE Wayland auto-paste** — requires `ydotoold` running and write access to `/dev/uinput`. `install.sh` sets up both (`ydotool.service` and a udev rule). If auto-paste still shows "Auto-paste is unavailable", run `./doctor.sh`; if you used the `input` group fallback, log out and back in.
-- **Image auto-paste** — always fires `Ctrl+V` regardless of `paste_mode`, since `Ctrl+Shift+V` never pastes images in any common app. Pasting works in browsers, image editors (GIMP, Inkscape), document apps (LibreOffice), etc. Terminals cannot accept image paste.
+- **Image auto-paste** — always fires `Ctrl+V` regardless of `paste_mode`, since `Ctrl+Shift+V` and `Shift+Insert` never paste images in any common app. Pasting works in browsers, image editors (GIMP, Inkscape), document apps (LibreOffice), etc. Terminals cannot accept image paste.
 - **File-manager image copy** — Ctrl+C on an image file in Nautilus/Files/Nemo/Thunar/Dolphin puts a file URI in the clipboard, not image bytes. CopyNinja detects this, reads the file, and stores it as a proper image entry.
 - **Sync and `max_entries`** — each device trims the shared folder to its own `max_entries`, so use the same limit on every synced device
 

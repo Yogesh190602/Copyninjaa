@@ -512,22 +512,14 @@ if [[ "$SESSION_TYPE" != "wayland" && "$SESSION_TYPE" != "x11" ]]; then
     info "Note: Daemon will auto-detect the display and start monitoring once a graphical session is available."
 fi
 
-# ── 4b. GNOME Wayland: create default config ──────────────────────────────
-# On GNOME Wayland, Mutter does not expose the focused window class to
-# external tools, so auto-detection of "am I pasting into a terminal?"
-# silently fails and pastes end up as Ctrl+V, which terminals ignore.
-# Create a default config forcing terminal paste mode — only if the user
-# doesn't already have a config file (never overwrite).
-CONFIG_DIR="$HOME/.config/copyninja"
-CONFIG_FILE="$CONFIG_DIR/config.toml"
-
-if [[ "$SESSION_TYPE" == "wayland" && "$DESKTOP" == *GNOME* ]]; then
-    if [[ -f "$CONFIG_FILE" ]]; then
-        info "Config already exists at $CONFIG_FILE — leaving it alone."
-    else
-        step "Creating default GNOME Wayland config…"
-        mkdir -p "$CONFIG_DIR"
-        cat > "$CONFIG_FILE" <<'EOF'
+# ── 4b. GNOME Wayland: update the old default config ──────────────────────
+# Older versions wrote a config forcing paste_mode = "terminal" on GNOME
+# Wayland: Ctrl+Shift+V, which text editors ignore. "auto" now pastes with
+# Shift+Insert when the focused window can't be identified, which works in
+# terminals and text fields alike, so swap that generated block for one using
+# it. A config the user wrote or edited is left alone.
+CONFIG_FILE="$HOME/.config/copyninja/config.toml"
+OLD_GNOME_CONFIG=$(cat <<'EOF'
 # CopyNinja config — created by install.sh for GNOME Wayland.
 #
 # On GNOME Wayland, Mutter does not expose the focused window class to
@@ -543,9 +535,26 @@ if [[ "$SESSION_TYPE" == "wayland" && "$DESKTOP" == *GNOME* ]]; then
 # regardless of this setting.
 paste_mode = "terminal"
 EOF
-        info "Wrote $CONFIG_FILE (paste_mode = \"terminal\")"
-        warn "If you mainly paste into text fields (not terminals),"
-        warn "  edit $CONFIG_FILE and change paste_mode to \"normal\"."
+)
+NEW_GNOME_CONFIG=$(cat <<'EOF'
+# CopyNinja config — see the README for every option.
+#
+# GNOME Wayland doesn't tell other apps which window is focused, so "auto"
+# pastes with Shift+Insert there: it works in terminals and in text fields.
+# Use "terminal" (always Ctrl+Shift+V) or "normal" (always Ctrl+V) to force
+# one shortcut. Images always paste with Ctrl+V.
+paste_mode = "auto"
+EOF
+)
+OLD_LINES=$(printf '%s\n' "$OLD_GNOME_CONFIG" | wc -l)
+if [[ -f "$CONFIG_FILE" && "$(head -n "$OLD_LINES" "$CONFIG_FILE")" == "$OLD_GNOME_CONFIG" ]]; then
+    NEW_CONFIG="$CONFIG_FILE.new.$$"
+    if { printf '%s\n' "$NEW_GNOME_CONFIG"; tail -n +"$((OLD_LINES + 1))" "$CONFIG_FILE"; } > "$NEW_CONFIG" \
+        && mv -f "$NEW_CONFIG" "$CONFIG_FILE"; then
+        info "Updated $CONFIG_FILE: paste_mode \"terminal\" → \"auto\" (Shift+Insert pastes in terminals and text editors)."
+    else
+        rm -f "$NEW_CONFIG"
+        warn "Could not update $CONFIG_FILE. Change paste_mode to \"auto\" so pasting works in text editors too."
     fi
 fi
 
